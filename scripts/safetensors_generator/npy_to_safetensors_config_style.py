@@ -46,6 +46,8 @@ MAX_FRAMES = 30  # None = 不限制；例如 30 = 只取前 30 帧
 SCALE = 2.0  # LR -> HR 比例（常见为 2.0）
 MOTION_INPUT_ORDER = "xy"  # 你的数据是 xy
 JITTER_INPUT_ORDER = "xy"  # 你的数据是 xy
+MOTION_SIGN = -1.0  # 常见需要 -1.0；不确定可试 +1.0
+MOTION_SHIFT = 0  # 0: 不移位, 1: t帧使用t-1运动矢量
 
 # 如果深度是 reverse-z（近处=1，远处=0）则设 True；否则 False
 REVERSE_Z = False
@@ -61,6 +63,20 @@ INFINITE_Z_FAR = False
 
 # 序列 id（int64）
 SEQ_ID = 8897243125409831936
+
+# Jitter 处理
+JITTER_FROM_01_TO_CENTERED = True  # 若源是[0,1]，转成[-0.5,0.5]
+JITTER_CENTER_SIGN = 1.0  # +1: (j-0.5), -1: -(j-0.5)
+JITTER_CLAMP = 0.499  # 避免 +0.5 边界导致黑化
+QUANTIZE_JITTER_TO_8_GRID = False  # 可选：量化到8相位网格，降低分布偏移
+
+# 若 motion 含 jitter 分量，可开启补偿
+APPLY_JITTER_COMP = False
+JITTER_COMP_SIGN = -1.0  # 常见先试 -1.0，不行再试 +1.0
+
+# 若无可信相机参数，可先用占位 depth_params 以避免错误深度裁剪
+USE_PLACEHOLDER_DEPTH_PARAMS = False
+PLACEHOLDER_DEPTH_PARAMS = (1.0, 0.0, 0.0, 0.0)
 
 # 文件名模板（与你的数据严格一致）
 PATTERNS = {
@@ -174,6 +190,12 @@ def make_depth_params(
     return z_near_t, z_far_t, fov_y_t, reverse_z_t, infinite_z_far_t, depth_params
 
 
+def quantize_jitter_8grid(jitter: torch.Tensor) -> torch.Tensor:
+    """Quantize centered jitter to 8x8 grid in [-0.5, 0.5)."""
+    jitter_q = (torch.floor((jitter + 0.5) * 8.0) + 0.5) / 8.0 - 0.5
+    return torch.clamp(jitter_q, -JITTER_CLAMP, JITTER_CLAMP)
+
+
 # ------------------------------------------------------------
 # 主逻辑
 # ------------------------------------------------------------
@@ -220,7 +242,13 @@ def main() -> None:
 
         # Convert XY -> YX for NSS convention
         motion = xy_to_yx(motion, MOTION_INPUT_ORDER)
+        motion = motion * float(MOTION_SIGN)
         jitter = xy_to_yx(jitter, JITTER_INPUT_ORDER)
+        if JITTER_FROM_01_TO_CENTERED:
+            jitter = float(JITTER_CENTER_SIGN) * (jitter - 0.5)
+        jitter = torch.clamp(jitter, -JITTER_CLAMP, JITTER_CLAMP)
+        if QUANTIZE_JITTER_TO_8_GRID:
+            jitter = quantize_jitter_8grid(jitter)
 
         # Depth handling
         if REVERSE_Z:
@@ -240,6 +268,14 @@ def main() -> None:
     motion_lr_tensor = torch.stack(motion_list, dim=0)  # [T,2,H,W], YX, pixels
     depth_tensor = torch.stack(depth_list, dim=0)  # [T,1,H,W]
     jitter_tensor = torch.stack(jitter_list, dim=0)  # [T,2,1,1], YX, pixels
+
+    if MOTION_SHIFT == 1:
+        motion_lr_tensor = torch.cat([motion_lr_tensor[:1], motion_lr_tensor[:-1]], dim=0)
+
+    if APPLY_JITTER_COMP:
+        jit_delta = torch.zeros_like(jitter_tensor)
+        jit_delta[1:] = jitter_tensor[1:] - jitter_tensor[:-1]  # curr - prev
+        motion_lr_tensor = motion_lr_tensor + float(JITTER_COMP_SIGN) * jit_delta
 
     t, _, h, w = colour_tensor.shape
     out_h = int(round(h * SCALE))
@@ -261,21 +297,31 @@ def main() -> None:
     out_dims = torch.tensor([[out_h, out_w]], dtype=torch.int32).repeat(t, 1)
     exposure = torch.zeros((t, 1), dtype=torch.float32)  # log exposure
 
-    (
-        z_near_t,
-        z_far_t,
-        fov_y_t,
-        reverse_z_t,
-        infinite_z_far_t,
-        depth_params,
-    ) = make_depth_params(
-        render_size=render_size,
-        z_near=Z_NEAR,
-        z_far=Z_FAR,
-        fov_y_rad=FOV_Y_RAD,
-        reverse_z=REVERSE_Z,
-        infinite_z_far=INFINITE_Z_FAR,
-    )
+    if USE_PLACEHOLDER_DEPTH_PARAMS:
+        z_near_t = torch.full((t, 1), float(Z_NEAR), dtype=torch.float32)
+        z_far_t = torch.full((t, 1), float(Z_FAR), dtype=torch.float32)
+        fov_y_t = torch.full((t, 1), float(FOV_Y_RAD), dtype=torch.float32)
+        reverse_z_t = torch.full((t, 1), bool(REVERSE_Z), dtype=torch.bool)
+        infinite_z_far_t = torch.full((t, 1), bool(INFINITE_Z_FAR), dtype=torch.bool)
+        depth_params = (
+            torch.tensor([PLACEHOLDER_DEPTH_PARAMS], dtype=torch.float32).repeat(t, 1)
+        )
+    else:
+        (
+            z_near_t,
+            z_far_t,
+            fov_y_t,
+            reverse_z_t,
+            infinite_z_far_t,
+            depth_params,
+        ) = make_depth_params(
+            render_size=render_size,
+            z_near=Z_NEAR,
+            z_far=Z_FAR,
+            fov_y_rad=FOV_Y_RAD,
+            reverse_z=REVERSE_Z,
+            infinite_z_far=INFINITE_Z_FAR,
+        )
 
     seq = torch.full((t, 1), int(SEQ_ID), dtype=torch.int64)
     scale_t = torch.full((t, 1), float(SCALE), dtype=torch.float32)
@@ -288,6 +334,10 @@ def main() -> None:
     print(" depth               :", tuple(depth_tensor.shape))
     print(" jitter              :", tuple(jitter_tensor.shape))
     print(" depth_params        :", tuple(depth_params.shape))
+    print(
+        " jitter range         :",
+        f"{float(jitter_tensor.min()):.6f} .. {float(jitter_tensor.max()):.6f}",
+    )
 
     tensors = {
         "colour_linear": colour_tensor.to(torch.float32),
