@@ -8,8 +8,13 @@
 This helper is intended for cases where data has already been captured as NPY arrays
 instead of EXR files expected by the existing safetensors_writer pipeline.
 
+Two input modes are supported:
+  1) Array mode: pass stacked files with --color-npy/--motion-npy/--depth-npy/--jitter-npy
+  2) Directory mode: pass --data-dir and regex patterns to collect per-frame files
+
 Input arrays can be channel-first (T,C,H,W) or channel-last (T,H,W,C) for colour/motion/depth.
-Jitter supports (T,2), (T,2,1,1), or (T,1,1,2).
+Jitter supports (T,2), (T,2,1,1), or (T,1,1,2) in array mode, and common frame-wise shapes
+in directory mode.
 """
 
 from __future__ import annotations
@@ -17,7 +22,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+import re
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +37,143 @@ def _load_npy(path: Path) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
     return np.load(path)
+
+
+def _to_chw(array: np.ndarray, channels: int, name: str) -> torch.Tensor:
+    """Convert one frame array into (C, H, W)."""
+    arr = np.asarray(array)
+    if arr.ndim == 3:
+        if arr.shape[0] == channels:
+            out = arr
+        elif arr.shape[-1] == channels:
+            out = np.transpose(arr, (2, 0, 1))
+        else:
+            raise ValueError(
+                f"{name} frame has unsupported shape {arr.shape}. "
+                f"Expected channel dim == {channels}."
+            )
+    elif arr.ndim == 2 and channels == 1:
+        out = arr[None, :, :]
+    else:
+        raise ValueError(
+            f"{name} frame has unsupported shape {arr.shape}. "
+            "Expected (C,H,W), (H,W,C), or (H,W) for 1-channel tensors."
+        )
+    return torch.from_numpy(out).to(torch.float32)
+
+
+def _to_jitter_chw(array: np.ndarray) -> torch.Tensor:
+    """Convert one frame jitter array into (2, 1, 1)."""
+    arr = np.asarray(array)
+    if arr.ndim == 1 and arr.shape[0] == 2:
+        out = arr[:, None, None]
+    elif arr.ndim == 2:
+        if arr.shape == (1, 2):
+            out = arr.reshape(2, 1, 1)
+        elif arr.shape == (2, 1):
+            out = arr.reshape(2, 1, 1)
+        else:
+            raise ValueError(
+                f"Unsupported jitter frame shape {arr.shape}. "
+                "Expected (2,), (1,2), or (2,1) when ndim=2."
+            )
+    elif arr.ndim == 3:
+        if arr.shape == (2, 1, 1):
+            out = arr
+        elif arr.shape == (1, 1, 2):
+            out = np.transpose(arr, (2, 0, 1))
+        else:
+            raise ValueError(
+                f"Unsupported jitter frame shape {arr.shape}. "
+                "Expected (2,1,1) or (1,1,2) when ndim=3."
+            )
+    else:
+        raise ValueError(
+            f"Unsupported jitter frame shape {arr.shape}. "
+            "Expected (2,), (1,2), (2,1), (2,1,1), or (1,1,2)."
+        )
+    return torch.from_numpy(out).to(torch.float32)
+
+
+def _build_frame_map(data_dir: Path, pattern: str, name: str) -> Dict[int, Path]:
+    """Build a {frame_id: path} map from a filename regex with one capture group."""
+    rx = re.compile(pattern)
+    out: Dict[int, Path] = {}
+    for npy_path in data_dir.glob("*.npy"):
+        m = rx.fullmatch(npy_path.name)
+        if not m:
+            continue
+        frame_id = int(m.group(1))
+        if frame_id in out:
+            raise ValueError(
+                f"Duplicate {name} frame id {frame_id} in directory {data_dir}"
+            )
+        out[frame_id] = npy_path
+    return out
+
+
+def _load_from_frame_directory(
+    data_dir: Path,
+    pattern_color: str,
+    pattern_motion: str,
+    pattern_depth: str,
+    pattern_jitter: str,
+    frame_start: int | None,
+    frame_end: int | None,
+    max_frames: int | None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load per-frame npy files and stack them into TCHW tensors."""
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Missing data directory: {data_dir}")
+
+    color_map = _build_frame_map(data_dir, pattern_color, "color")
+    motion_map = _build_frame_map(data_dir, pattern_motion, "motion")
+    depth_map = _build_frame_map(data_dir, pattern_depth, "depth")
+    jitter_map = _build_frame_map(data_dir, pattern_jitter, "jitter")
+
+    common_ids = sorted(
+        set(color_map.keys())
+        & set(motion_map.keys())
+        & set(depth_map.keys())
+        & set(jitter_map.keys())
+    )
+    if not common_ids:
+        raise RuntimeError(
+            "No complete frame ids found across color/motion/depth/jitter patterns."
+        )
+
+    if frame_start is not None:
+        common_ids = [i for i in common_ids if i >= frame_start]
+    if frame_end is not None:
+        common_ids = [i for i in common_ids if i <= frame_end]
+    if not common_ids:
+        raise RuntimeError("No frames left after applying frame_start/frame_end filters.")
+
+    if max_frames is not None:
+        if max_frames <= 0:
+            raise ValueError("max_frames must be > 0")
+        common_ids = common_ids[:max_frames]
+
+    colour_list = []
+    motion_list = []
+    depth_list = []
+    jitter_list = []
+    for fid in common_ids:
+        colour_list.append(_to_chw(_load_npy(color_map[fid]), channels=3, name="colour"))
+        motion_list.append(_to_chw(_load_npy(motion_map[fid]), channels=2, name="motion"))
+        depth_list.append(_to_chw(_load_npy(depth_map[fid]), channels=1, name="depth"))
+        jitter_list.append(_to_jitter_chw(_load_npy(jitter_map[fid])))
+
+    colour = torch.stack(colour_list, dim=0)
+    motion = torch.stack(motion_list, dim=0)
+    depth = torch.stack(depth_list, dim=0)
+    jitter = torch.stack(jitter_list, dim=0)
+
+    print(
+        f"Loaded {len(common_ids)} frames from {data_dir} "
+        f"(frame range: {common_ids[0]}..{common_ids[-1]})"
+    )
+    return colour, depth, jitter, motion
 
 
 def _to_tchw(array: np.ndarray, channels: int, name: str) -> torch.Tensor:
@@ -200,11 +343,69 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert NSS NPY tensors to a single .safetensors sequence."
     )
-    parser.add_argument("--color-npy", type=Path, required=True)
-    parser.add_argument("--jitter-npy", type=Path, required=True)
-    parser.add_argument("--motion-npy", type=Path, required=True)
-    parser.add_argument("--depth-npy", type=Path, required=True)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory mode: load per-frame npy files matched by regex patterns. "
+            "Use this for files like r_input_color_jittered01001.npy."
+        ),
+    )
+
+    parser.add_argument(
+        "--color-npy",
+        type=Path,
+        default=None,
+        help="Array mode: path to stacked color array.",
+    )
+    parser.add_argument(
+        "--jitter-npy",
+        type=Path,
+        default=None,
+        help="Array mode: path to stacked jitter array.",
+    )
+    parser.add_argument(
+        "--motion-npy",
+        type=Path,
+        default=None,
+        help="Array mode: path to stacked motion array.",
+    )
+    parser.add_argument(
+        "--depth-npy",
+        type=Path,
+        default=None,
+        help="Array mode: path to stacked depth array.",
+    )
     parser.add_argument("--output", type=Path, required=True)
+
+    parser.add_argument(
+        "--pattern-color",
+        type=str,
+        default=r"r_input_color_jittered(\d+)\.npy",
+        help="Regex pattern for color files in --data-dir (must include one frame-id capture group).",
+    )
+    parser.add_argument(
+        "--pattern-motion",
+        type=str,
+        default=r"r_motion_vectors(\d+)\.npy",
+        help="Regex pattern for motion files in --data-dir (must include one frame-id capture group).",
+    )
+    parser.add_argument(
+        "--pattern-depth",
+        type=str,
+        default=r"r_depth(\d+)\.npy",
+        help="Regex pattern for depth files in --data-dir (must include one frame-id capture group).",
+    )
+    parser.add_argument(
+        "--pattern-jitter",
+        type=str,
+        default=r"r_jitter(\d+)\.npy",
+        help="Regex pattern for jitter files in --data-dir (must include one frame-id capture group).",
+    )
+    parser.add_argument("--frame-start", type=int, default=None)
+    parser.add_argument("--frame-end", type=int, default=None)
+    parser.add_argument("--max-frames", type=int, default=None)
 
     parser.add_argument(
         "--ground-truth-npy",
@@ -285,10 +486,35 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    colour_linear = _to_tchw(_load_npy(args.color_npy), channels=3, name="colour_linear")
-    depth = _to_tchw(_load_npy(args.depth_npy), channels=1, name="depth")
-    jitter = _to_jitter_tchw(_load_npy(args.jitter_npy))
-    motion_in = _to_tchw(_load_npy(args.motion_npy), channels=2, name="motion")
+    if args.data_dir is not None:
+        colour_linear, depth, jitter, motion_in = _load_from_frame_directory(
+            data_dir=args.data_dir,
+            pattern_color=args.pattern_color,
+            pattern_motion=args.pattern_motion,
+            pattern_depth=args.pattern_depth,
+            pattern_jitter=args.pattern_jitter,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+            max_frames=args.max_frames,
+        )
+    else:
+        required_array_args = [
+            args.color_npy,
+            args.depth_npy,
+            args.jitter_npy,
+            args.motion_npy,
+        ]
+        if any(x is None for x in required_array_args):
+            raise ValueError(
+                "Array mode requires --color-npy --depth-npy --jitter-npy --motion-npy. "
+                "Alternatively use --data-dir for per-frame file mode."
+            )
+        colour_linear = _to_tchw(
+            _load_npy(args.color_npy), channels=3, name="colour_linear"
+        )
+        depth = _to_tchw(_load_npy(args.depth_npy), channels=1, name="depth")
+        jitter = _to_jitter_tchw(_load_npy(args.jitter_npy))
+        motion_in = _to_tchw(_load_npy(args.motion_npy), channels=2, name="motion")
 
     t, _, in_height, in_width = colour_linear.shape
     _check_frames("depth", t, depth)
