@@ -257,7 +257,9 @@ def _make_depth_params(
     fov_y_rad: float,
     reverse_z: bool,
     infinite_z_far: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Create NSS depth-related scalar tensors and depth_params."""
     t = render_size.shape[0]
     device = render_size.device
@@ -278,7 +280,8 @@ def _make_depth_params(
         infinite=make_image_like(infinite_z_far_t),
         renderSizeWidth=make_image_like(render_size[:, 1:2].to(torch.float32)),
         renderSizeHeight=make_image_like(render_size[:, 0:1].to(torch.float32)),
-        inverted=reverse_z_t,
+        # Keep rank aligned with other inputs to avoid accidental broadcasting to (T,1,T,1).
+        inverted=make_image_like(reverse_z_t),
     ).squeeze(-1).squeeze(-1)
 
     return z_near_t, z_far_t, fov_y_t, reverse_z_t, infinite_z_far_t, depth_params
