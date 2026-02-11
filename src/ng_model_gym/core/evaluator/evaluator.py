@@ -199,6 +199,21 @@ class NGModelEvaluator:
                 self.export_png_dir / "ground_truth" / f"frame_{self.idx:04d}_gt.png",
             )
 
+            # Save exact model-internal colour input used by PostProcess (preferred when present).
+            if (
+                isinstance(self.model_outputs, dict)
+                and "postprocess_input_colour_linear" in self.model_outputs
+            ):
+                postprocess_input = self._extract_first_sample_for_png(
+                    self.model_outputs["postprocess_input_colour_linear"]
+                )
+                torchvision.utils.save_image(
+                    postprocess_input,
+                    self.export_png_dir
+                    / "input"
+                    / f"frame_{self.idx:04d}_postprocess_colour_linear.png",
+                )
+
             # Save current raw input frame for debug/visual alignment checks.
             if isinstance(self.x_in, dict):
                 input_key = "colour_linear" if "colour_linear" in self.x_in else "colour"
