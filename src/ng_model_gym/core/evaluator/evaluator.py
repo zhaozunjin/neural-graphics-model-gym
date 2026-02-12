@@ -39,6 +39,7 @@ class NGModelEvaluator:
         self.x_in = None
         self.y_true = None
         self.y_pred = None
+        self.model_outputs = None
         self.results = {}
 
         for metric in self.metrics:
@@ -99,7 +100,24 @@ class NGModelEvaluator:
 
     def _run_model(self):
         """Invoke single forward pass."""
-        self.y_pred = self.model(self.x_in)["output"]
+        self.model_outputs = self.model(self.x_in)
+        if isinstance(self.model_outputs, dict):
+            self.y_pred = self.model_outputs["output"]
+        else:
+            self.y_pred = self.model_outputs
+
+    @staticmethod
+    def _extract_first_sample_for_png(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert tensor to format accepted by torchvision.save_image.
+
+        For recurrent outputs, tensors are often 5D: [N, T, C, H, W].
+        save_image accepts 3D [C,H,W] or 4D [N,C,H,W], so we select N=0.
+        """
+        if tensor.ndim == 5:
+            return tensor[0]  # [T, C, H, W]
+        if tensor.ndim == 4:
+            return tensor[0]  # [C, H, W]
+        return tensor
 
     def _update_progress_bar(self, pbar, update_interval=1):
         if self.idx % update_interval == 0:
@@ -142,6 +160,7 @@ class NGModelEvaluator:
             )
             create_directory(self.export_png_dir / "predicted")
             create_directory(self.export_png_dir / "ground_truth")
+            create_directory(self.export_png_dir / "input")
         self.model.eval()
         if isinstance(self.model, FeedbackModel):
             self.model.reset_history_buffers()
@@ -169,14 +188,43 @@ class NGModelEvaluator:
                 else:
                     metric.update(self.y_pred, self.y_true)
         if self.export_png_dir:
+            predicted = self._extract_first_sample_for_png(self.y_pred)
+            ground_truth = self._extract_first_sample_for_png(self.y_true)
             torchvision.utils.save_image(
-                self.y_pred[0],
+                predicted,
                 self.export_png_dir / "predicted" / f"frame_{self.idx:04d}_pred.png",
             )
             torchvision.utils.save_image(
-                self.y_true[0],
+                ground_truth,
                 self.export_png_dir / "ground_truth" / f"frame_{self.idx:04d}_gt.png",
             )
+
+            # Save exact model-internal colour input used by PostProcess (preferred when present).
+            if (
+                isinstance(self.model_outputs, dict)
+                and "postprocess_input_colour_linear" in self.model_outputs
+            ):
+                postprocess_input = self._extract_first_sample_for_png(
+                    self.model_outputs["postprocess_input_colour_linear"]
+                )
+                torchvision.utils.save_image(
+                    postprocess_input,
+                    self.export_png_dir
+                    / "input"
+                    / f"frame_{self.idx:04d}_postprocess_colour_linear.png",
+                )
+
+            # Save current raw input frame for debug/visual alignment checks.
+            if isinstance(self.x_in, dict):
+                input_key = "colour_linear" if "colour_linear" in self.x_in else "colour"
+                if input_key in self.x_in:
+                    input_frame = self._extract_first_sample_for_png(self.x_in[input_key])
+                    torchvision.utils.save_image(
+                        input_frame,
+                        self.export_png_dir
+                        / "input"
+                        / f"frame_{self.idx:04d}_{input_key}.png",
+                    )
 
     def _save_results_json(self):
         to_json = {}

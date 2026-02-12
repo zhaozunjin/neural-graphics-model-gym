@@ -229,6 +229,10 @@ class NSSModel(BaseNGModel):
             "derivative": derivative,
             "depth_dilated": depth_dilated,  # on shader accurate this is actually offsets
         }
+        # Expose the exact colour tensor consumed by PostProcess for debug/export.
+        # Useful to compare model-internal input with predicted/debug outputs.
+        if not self.training:
+            outputs["postprocess_input_colour_linear"] = inputs["colour_linear"]
         return outputs
 
     def define_dynamic_export_model_input(self):
