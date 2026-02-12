@@ -8,6 +8,14 @@ import "./depth_clip";
 
 #define EPS 1e-7
 
+// Debug switch for post_process_v1:
+// 0 = default NSS behaviour (jitter-driven sparse sampling via offset_lut)
+// 1 = disable jitter path (force tile = {0,0,1})
+//     Useful for isolating whether residual flicker is caused by jitter path mismatch.
+#ifndef DISABLE_JITTER_DEBUG
+#define DISABLE_JITTER_DEBUG 0
+#endif
+
 [NoDiffThis]
 public void ShaderAccurateFindNearestDepth(TensorView<float> depth_tensor, uint b, float2 uv, bool inverted, out float nearestDepth, out int2 nearestDepthCoordOffset)
 {
@@ -599,11 +607,14 @@ void post_process_v1(
 
         // Find the relevant jitter details for this tap
         int2 tiled_idx = abs(tap % int2(idx_mod));
-        float3 tile = float3(
+        float3 tile = float3(0.f, 0.f, 1.f);
+        #if !DISABLE_JITTER_DEBUG
+        tile = float3(
             no_diff(offset_lut[uint4(idx.x, 0, tiled_idx)]),
             no_diff(offset_lut[uint4(idx.x, 1, tiled_idx)]),
             no_diff(offset_lut[uint4(idx.x, 2, tiled_idx)])
         );
+        #endif
 
         // Given the jittered coordinate load the corresponding low-res input
         int2 lr_tap = clamp(int2(floor((tap + 0.5f) * rcp(scale))) + int2(tile.xy), 0, colour_size - 1);
@@ -645,11 +656,14 @@ void post_process_v1(
 
     // Accumulate the low resolution sample, if valid, for the current output pixel
     int2 tiled_idx = abs(base_idx % int2(idx_mod));
-    float3 tile = float3(
+    float3 tile = float3(0.f, 0.f, 1.f);
+    #if !DISABLE_JITTER_DEBUG
+    tile = float3(
         no_diff(offset_lut[uint4(idx.x, 0, tiled_idx)]),
         no_diff(offset_lut[uint4(idx.x, 1, tiled_idx)]),
         no_diff(offset_lut[uint4(idx.x, 2, tiled_idx)])
     );
+    #endif
     int2 lr_tap = clamp(lr_coord + int2(tile.xy), 0, colour_size - 1);
     float3 colour_to_accum = MaxHalf(float3(
         no_diff(colour[uint4(idx.x, 0, lr_tap)]),
