@@ -11,7 +11,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors import safe_open
 
+from ng_model_gym.core.model.layers.dense_warp import DenseWarp
 from ng_model_gym.core.utils.exr_utils import read_exr_torch
 from scripts.safetensors_generator.dataset_reader import (
     generic_safetensors_reader,
@@ -105,6 +107,89 @@ class TestSafetensorsWriter(unittest.TestCase):
                     f"Name: {name}, Value: {test_target_parsed} "
                     f"(Reference: {test_ref}), Test Skipped"
                 )
+
+    def test_motion_channel_order_and_unit_conversion(self):
+        """Motion is stored in safetensors as YX channels in pixel units."""
+        generic_safetensors_writer(self.args)
+
+        written = generic_safetensors_reader(self.output_path, 0)
+        motion_raw_path = sorted((self.args.src / "motion_gt" / self.seq_path).glob("*.exr"))[
+            0
+        ]
+        motion_raw = read_exr_torch(
+            motion_raw_path,
+            dtype=np.float16,
+            channels="RG",
+        )
+
+        # EXR motion is XY (UV); writer stores YX (pixels) with clamped UV first.
+        motion_raw = torch.clamp(
+            motion_raw, -torch.ones_like(motion_raw), torch.ones_like(motion_raw)
+        )
+        h, w = motion_raw.shape[1], motion_raw.shape[2]
+        expected = torch.stack(
+            [motion_raw[1] * h, motion_raw[0] * w],
+            dim=0,
+        ).to(written["motion"].dtype)
+
+        self.assertTrue(
+            torch.allclose(written["motion"], expected, atol=5e-3),
+            msg="Motion tensor does not match expected YX pixel-space conversion.",
+        )
+
+    def test_jitter_channel_order_and_centered_range(self):
+        """Jitter is stored as YX in pixels and should stay centered around zero."""
+        generic_safetensors_writer(self.args)
+
+        written = generic_safetensors_reader(self.output_path, 0)
+        with open(self.args.src / f"{self.seq_path}.json", "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        scale_idx = metadata["UpscalingRatiosIndices"]["x2_index"]
+        frame0 = metadata["Frames"][0]["NormalizedPerRatioJitter"][scale_idx]
+        render_h = float(written["render_size"][0].item())
+        render_w = float(written["render_size"][1].item())
+
+        expected_jitter = torch.tensor(
+            [frame0["Y"] * render_h, frame0["X"] * render_w],
+            dtype=written["jitter"].dtype,
+        ).reshape(2, 1, 1)
+
+        self.assertTrue(
+            torch.allclose(written["jitter"], expected_jitter, atol=1e-6),
+            msg="Jitter tensor does not match expected YX pixel-space conversion.",
+        )
+
+        with safe_open(self.output_path, framework="pt") as sf:
+            all_jitter = sf.get_tensor("jitter")
+
+        self.assertTrue(
+            torch.all(torch.abs(all_jitter) <= 0.5001),
+            msg="Expected centered jitter in approximately [-0.5, 0.5] pixels.",
+        )
+
+    def test_densewarp_motion_sign_convention(self):
+        """Positive X flow follows current-minus-previous convention."""
+        prev = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
+        prev[0, 0, 0, 1] = 1.0
+
+        flow = torch.zeros((1, 2, 1, 5), dtype=torch.float32)  # YX order
+        flow[:, 1, :, :] = 1.0  # +X
+
+        warp = DenseWarp(interpolation="nearest")
+        warped_pos = warp([prev, flow])
+        warped_neg = warp([prev, -flow])
+
+        self.assertEqual(
+            float(warped_pos[0, 0, 0, 2].item()),
+            1.0,
+            msg="Expected +X flow to move content to the right in current frame.",
+        )
+        self.assertEqual(
+            float(warped_neg[0, 0, 0, 0].item()),
+            1.0,
+            msg="Expected -X flow to move content to the left in current frame.",
+        )
 
     def test_safetensors_crop_number(self):
         """Test cropper produces correct number of cropped safetensors"""
